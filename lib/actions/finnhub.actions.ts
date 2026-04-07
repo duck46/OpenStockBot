@@ -149,6 +149,67 @@ export async function getNews(symbols?: string[]): Promise<MarketNewsArticle[]> 
     }
 }
 
+/**
+ * Fetch OHLCV candle data from Finnhub.
+ * @param symbol  Stock ticker (e.g. "AAPL")
+ * @param resolution  Candle resolution: "1","5","15","30","60","D","W","M"
+ * @param fromUnix  Start timestamp (Unix seconds)
+ * @param toUnix    End timestamp (Unix seconds)
+ */
+export async function getCandles(
+    symbol: string,
+    resolution: '1' | '5' | '15' | '30' | '60' | 'D' | 'W' | 'M',
+    fromUnix: number,
+    toUnix: number
+): Promise<{ o: number[]; h: number[]; l: number[]; c: number[]; v: number[]; t: number[]; s: string } | null> {
+    try {
+        const token = NEXT_PUBLIC_FINNHUB_API_KEY;
+        const url = `${FINNHUB_BASE_URL}/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=${resolution}&from=${fromUnix}&to=${toUnix}&token=${token}`;
+        const data = await fetchJSON<any>(url);
+        if (!data || data.s === 'no_data') return null;
+        return data;
+    } catch (e) {
+        console.error('Error fetching candles for', symbol, e);
+        return null;
+    }
+}
+
+/**
+ * Convenience: fetch the last N days of daily candles and return OHLCV array.
+ */
+export async function getDailyCandles(symbol: string, days = 60) {
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - days * 24 * 60 * 60;
+    const raw = await getCandles(symbol, 'D', from, to);
+    if (!raw || raw.s !== 'ok') return [];
+    return raw.t.map((ts: number, i: number) => ({
+        t: ts,
+        o: raw.o[i],
+        h: raw.h[i],
+        l: raw.l[i],
+        c: raw.c[i],
+        v: raw.v[i],
+    }));
+}
+
+/**
+ * Convenience: fetch intraday 5-min candles for today's session.
+ */
+export async function getIntradayCandles(symbol: string, hours = 7) {
+    const to = Math.floor(Date.now() / 1000);
+    const from = to - hours * 60 * 60;
+    const raw = await getCandles(symbol, '5', from, to);
+    if (!raw || raw.s !== 'ok') return [];
+    return raw.t.map((ts: number, i: number) => ({
+        t: ts,
+        o: raw.o[i],
+        h: raw.h[i],
+        l: raw.l[i],
+        c: raw.c[i],
+        v: raw.v[i],
+    }));
+}
+
 export const searchStocks = cache(async (query?: string): Promise<StockWithWatchlistStatus[]> => {
     try {
         const token = NEXT_PUBLIC_FINNHUB_API_KEY;

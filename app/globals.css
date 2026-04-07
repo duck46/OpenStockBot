@@ -487,3 +487,12 @@
 .scrollbar-hide-default::-webkit-scrollbar-thumb:hover {
     background-color: #9095A1;
 }
+
+/* === TRADING BOT FORM UTILITIES === */
+.input-sm {
+    @apply w-full rounded-lg bg-zinc-800 border border-zinc-700 text-white text-sm px-3 py-2 focus:outline-none focus:border-teal-500 transition-colors;
+}
+
+.label-sm {
+    @apply block text-xs text-zinc-500 mb-1;
+}

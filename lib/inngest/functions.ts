@@ -6,6 +6,7 @@ import { getWatchlistSymbolsByEmail } from "@/lib/actions/watchlist.actions";
 import { getNews } from "@/lib/actions/finnhub.actions";
 import { getFormattedTodayDate } from "@/lib/utils";
 import { callAIProviderWithFallback } from "@/lib/ai-provider";
+import { isMarketHours, isPreMarket, todayET, DAILY_BUDGET_CAD } from "@/lib/trading/risk-manager";
 
 export const sendSignUpEmail = inngest.createFunction(
     { id: 'sign-up-email', triggers: [{ event: 'app/user.created' }] },
@@ -462,5 +463,232 @@ export const checkInactiveUsers = inngest.createFunction(
         });
 
         return { processed: inactiveUsers.length, sent: results };
+    }
+);
+
+// ─── TRADING BOT JOBS ─────────────────────────────────────────────────────────
+
+/**
+ * Pre-Market Scan — runs at 8:30 AM ET on weekdays.
+ * Identifies gap-and-go candidates and overnight news plays before the open.
+ */
+export const preMarketScan = inngest.createFunction(
+    { id: 'pre-market-scan', triggers: [{ event: 'trading/pre-market.scan' }, { cron: '30 13 * * 1-5' }] }, // 8:30 AM ET = 13:30 UTC
+    async ({ step }) => {
+        const signals = await step.run('run-pre-market-scanner', async () => {
+            const { runFullScan, persistSignals } = await import('@/lib/trading/scanner');
+            const found = await runFullScan(55); // slightly higher threshold for pre-market
+            if (found.length > 0) {
+                await persistSignals(found);
+            }
+            return found.map((s) => ({
+                symbol: s.symbol,
+                strategy: s.strategy,
+                strength: s.adjustedStrength,
+                direction: s.direction,
+            }));
+        });
+
+        console.log(`[Pre-Market Scan] Found ${signals.length} signals:`, signals);
+        return { signals, count: signals.length, scanTime: new Date().toISOString() };
+    }
+);
+
+/**
+ * Intraday Signal Scan — runs every 5 minutes during market hours (9:30–16:00 ET).
+ * Refreshes the live signal list and checks open positions against SL/TP.
+ */
+export const intradaySignalScan = inngest.createFunction(
+    { id: 'intraday-signal-scan', triggers: [{ event: 'trading/intraday.scan' }, { cron: '*/5 14-21 * * 1-5' }] }, // 9:30–16:00 ET = 14:30–21:00 UTC
+    async ({ step }) => {
+        // Only run during real market hours
+        if (!isMarketHours() && !isPreMarket()) {
+            return { skipped: true, reason: 'Outside market hours' };
+        }
+
+        const signals = await step.run('run-intraday-scanner', async () => {
+            const { runFullScan, persistSignals } = await import('@/lib/trading/scanner');
+            const found = await runFullScan(50);
+            if (found.length > 0) {
+                await persistSignals(found);
+            }
+            return found.map((s) => ({
+                symbol: s.symbol,
+                strategy: s.strategy,
+                strength: s.adjustedStrength,
+                direction: s.direction,
+                reasoning: s.reasoning,
+            }));
+        });
+
+        // Check open positions for SL/TP hits
+        const positionAlerts = await step.run('check-position-exits', async () => {
+            const { connectToDatabase } = await import('@/database/mongoose');
+            const { Trade } = await import('@/database/models/trade.model');
+            const { getQuote } = await import('@/lib/actions/finnhub.actions');
+            const { checkExitCondition, calculatePnl, todayET } = await import('@/lib/trading/risk-manager');
+            const { DailyBudget } = await import('@/database/models/daily-budget.model');
+
+            await connectToDatabase();
+            const openTrades = await Trade.find({ status: 'OPEN' }).lean();
+            const alerts: string[] = [];
+
+            for (const trade of openTrades) {
+                try {
+                    const quote = await getQuote(trade.symbol);
+                    if (!quote?.c) continue;
+
+                    const exitSignal = checkExitCondition(
+                        trade.direction,
+                        quote.c,
+                        trade.stopLoss,
+                        trade.takeProfit
+                    );
+
+                    if (exitSignal) {
+                        const { pnlCAD, pnlPercent } = calculatePnl(
+                            trade.direction,
+                            trade.entryPrice,
+                            quote.c,
+                            trade.quantity
+                        );
+                        await Trade.findByIdAndUpdate(trade._id, {
+                            status: 'CLOSED',
+                            exitPrice: quote.c,
+                            pnlCAD,
+                            pnlPercent,
+                            closedAt: new Date(),
+                        });
+                        const today = todayET();
+                        await DailyBudget.findOneAndUpdate(
+                            { userId: trade.userId, date: today },
+                            { $inc: { realizedPnlCAD: pnlCAD, remainingCAD: trade.allocatedCAD + pnlCAD, usedCAD: -trade.allocatedCAD } }
+                        );
+                        const emoji = exitSignal === 'TAKE_PROFIT' ? '✅' : '🛑';
+                        alerts.push(`${emoji} ${trade.symbol} auto-closed (${exitSignal}): P&L ${pnlCAD >= 0 ? '+' : ''}$${pnlCAD.toFixed(2)} CAD`);
+                    }
+                } catch (e) {
+                    console.error(`Failed to check exit for ${trade.symbol}:`, e);
+                }
+            }
+            return alerts;
+        });
+
+        return {
+            signals: signals.length,
+            positionAlerts,
+            scanTime: new Date().toISOString(),
+        };
+    }
+);
+
+/**
+ * Daily Trading Recap — runs at 5:00 PM ET after market close.
+ * Calculates daily P&L and sends a personalized email summary to each trader.
+ */
+export const dailyTradingRecap = inngest.createFunction(
+    { id: 'daily-trading-recap', triggers: [{ event: 'trading/daily.recap' }, { cron: '0 22 * * 1-5' }] }, // 5 PM ET = 22:00 UTC
+    async ({ step }) => {
+        const today = todayET();
+
+        const recaps = await step.run('generate-trader-recaps', async () => {
+            const { connectToDatabase } = await import('@/database/mongoose');
+            const { Trade } = await import('@/database/models/trade.model');
+            const { DailyBudget } = await import('@/database/models/daily-budget.model');
+            const mongoose = await connectToDatabase();
+            const db = mongoose.connection.db;
+            if (!db) throw new Error('No DB connection');
+
+            // Find all users who have trades today
+            const todayStart = new Date();
+            todayStart.setHours(0, 0, 0, 0);
+
+            const activeBudgets = await DailyBudget.find({ date: today }).lean();
+            const results: Array<{ userId: string; email: string; summary: string; pnl: number }> = [];
+
+            for (const budget of activeBudgets) {
+                const userDoc = await db.collection('user').findOne({ _id: new (await import('mongoose')).Types.ObjectId(budget.userId) });
+                if (!userDoc?.email) continue;
+
+                const trades = await Trade.find({
+                    userId: budget.userId,
+                    openedAt: { $gte: todayStart },
+                }).lean();
+
+                const closed = trades.filter((t) => t.status === 'CLOSED');
+                const open = trades.filter((t) => t.status === 'OPEN');
+                const pnl = budget.realizedPnlCAD;
+                const wins = closed.filter((t) => (t.pnlCAD ?? 0) > 0).length;
+                const losses = closed.filter((t) => (t.pnlCAD ?? 0) <= 0).length;
+
+                const aiPrompt = `You are a no-nonsense Wall Street trading coach. Write a brief (3-4 sentences) personalized daily recap email for a trader. Be direct, specific, and motivating but honest.
+
+Trader stats today (${today}):
+- Daily budget: $${DAILY_BUDGET_CAD} CAD
+- Total trades: ${trades.length} (${wins} wins, ${losses} losses, ${open.length} still open)
+- Realized P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} CAD
+- Win rate: ${closed.length > 0 ? ((wins / closed.length) * 100).toFixed(0) : 'N/A'}%
+- Best trade: ${closed.sort((a, b) => (b.pnlCAD ?? 0) - (a.pnlCAD ?? 0))[0]?.symbol ?? 'None'}
+
+Keep it tight. End with one specific thing they should improve tomorrow.`;
+
+                let summary: string;
+                try {
+                    summary = await callAIProviderWithFallback(aiPrompt);
+                } catch {
+                    summary = `Today's recap: ${trades.length} trade(s), P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} CAD. Win rate: ${closed.length > 0 ? ((wins / closed.length) * 100).toFixed(0) : 'N/A'}%. Keep the discipline tomorrow.`;
+                }
+
+                results.push({ userId: budget.userId, email: userDoc.email, summary, pnl });
+            }
+            return results;
+        });
+
+        // Send recap emails
+        await step.run('send-recap-emails', async () => {
+            const { sendWelcomeEmail } = await import('@/lib/nodemailer');
+
+            for (const recap of recaps) {
+                try {
+                    const subject = `📊 Your Trading Recap — ${today}`;
+                    const pnlColor = recap.pnl >= 0 ? '#20c997' : '#ef4444';
+                    const pnlSign = recap.pnl >= 0 ? '+' : '';
+
+                    const html = `
+<!DOCTYPE html><html><body style="margin:0;padding:0;background:#000;font-family:sans-serif;color:#fff;">
+<table width="100%" border="0" cellspacing="0" cellpadding="0" style="padding:20px;">
+<tr><td align="center">
+<div style="max-width:580px;border:2px dashed #20c997;border-radius:4px;padding:2px;">
+<div style="background:#111;padding:30px;">
+  <h2 style="margin:0 0 20px 0;color:#fff;"><span style="color:#20c997;">📊</span> OpenStock Trading</h2>
+  <h1 style="margin:0 0 10px 0;font-size:26px;">Daily Recap — ${today}</h1>
+  <div style="background:#1e1e1e;border-radius:8px;padding:20px;margin:20px 0;">
+    <p style="font-size:32px;font-weight:700;color:${pnlColor};margin:0;">${pnlSign}$${recap.pnl.toFixed(2)} CAD</p>
+    <p style="color:#888;margin:5px 0 0 0;">Today's Realized P&amp;L</p>
+  </div>
+  <div style="color:#ccc;font-size:15px;line-height:1.7;">${recap.summary.replace(/\n/g, '<br>')}</div>
+  <div style="margin-top:30px;padding-top:20px;border-top:1px dashed #333;text-align:center;font-size:12px;color:#555;">
+    <p>OpenStock Trading Bot &mdash; $${DAILY_BUDGET_CAD} CAD/day</p>
+  </div>
+</div></div>
+</td></tr></table>
+</body></html>`;
+
+                    // Reuse nodemailer send
+                    const { transporter } = await import('@/lib/nodemailer');
+                    await transporter.sendMail({
+                        from: `"OpenStock Trading" <${process.env.NODEMAILER_EMAIL}>`,
+                        to: recap.email,
+                        subject,
+                        html,
+                    });
+                    console.log(`✅ Recap sent to ${recap.email}: P&L $${recap.pnl.toFixed(2)}`);
+                } catch (e) {
+                    console.error(`Failed to send recap to ${recap.email}:`, e);
+                }
+            }
+        });
+
+        return { recapsSent: recaps.length, date: today };
     }
 );
