@@ -1,11 +1,9 @@
 /**
  * AI Analyst — uses the existing multi-provider LLM to enrich trading signals
- * with plain-English reasoning, risk flags, and conviction scoring.
+ * with beginner-friendly plain-English reasoning and risk flags.
  *
- * Written to mirror 20 years of institutional trading intuition:
- * - Checks macro context from recent news
- * - Validates technical thesis with fundamentals
- * - Flags sector rotation, earnings risk, and liquidity concerns
+ * Tone: patient, friendly guide for someone who has never traded before.
+ * No jargon (RSI, MACD, EMA, Bollinger, etc.) — everyday language only.
  */
 
 import { callAIProviderWithFallback } from '@/lib/ai-provider';
@@ -13,47 +11,39 @@ import type { IndicatorSummary } from './indicators';
 import type { StrategySignal } from './strategies';
 
 export interface AIAnalysis {
-    reasoning: string;       // 2-3 sentence plain-English explanation
-    riskFlags: string[];     // e.g. ["Earnings in 2 days", "Sector weak"]
+    reasoning: string;        // Plain-English "why" explanation for a beginner
+    riskFlags: string[];      // Plain-English risks, e.g. "Earnings in 2 days — price could swing hard"
     adjustedStrength: number; // AI may increase or decrease the technical score
 }
 
-const ANALYST_PROMPT = `You are a 20-year Wall Street veteran and day trader with deep experience in technical analysis, momentum trading, and risk management. You trade $50 CAD per day targeting 15-25% gains using tight risk controls.
+const ANALYST_PROMPT = `You are a friendly, patient guide helping a complete beginner understand a short-term trading opportunity. The person has never traded stocks before. Use simple everyday language — no finance jargon at all.
 
-Analyze this trading signal and provide your assessment:
+TRADE OPPORTUNITY:
+- Stock: {{symbol}}
+- What we want to do: Buy {{symbol}} and sell it for a quick profit today
+- Suggested amount to spend: ${{allocCAD}} CAD
+- Buy when price is around: ${{entryLow}} – ${{entryHigh}}
+- Sell immediately for safety if price drops to: ${{stopLoss}} (you would lose about {{riskPct}}% of what you put in)
+- Sell for profit when price reaches: ${{takeProfit}} (you would gain about {{rewardPct}}%)
 
-SYMBOL: {{symbol}}
-STRATEGY: {{strategy}}
-DIRECTION: {{direction}}
-TECHNICAL STRENGTH: {{strength}}/100
-CURRENT PRICE: \${{price}}
-ENTRY ZONE: \${{entryLow}} - \${{entryHigh}}
-STOP LOSS: \${{stopLoss}} (Risk: {{riskPct}}%)
-TAKE PROFIT: \${{takeProfit}} (Reward: {{rewardPct}}%)
+WHY THE BOT FLAGGED THIS:
+{{catalysts}}
 
-TECHNICAL INDICATORS:
-- RSI(14): {{rsi}}
-- EMA9/21/50: {{ema9}} / {{ema21}} / {{ema50}}
-- MACD: {{macd}} | Signal: {{macdSignal}} | Histogram: {{histogram}}
-- Bollinger %B: {{bbPctB}} | Bandwidth: {{bbBandwidth}}
-- ATR(14): {{atr}}
-- Volume Ratio: {{volRatio}}x vs 20-day avg
-- Gap: {{gap}}%
-
-CATALYSTS: {{catalysts}}
-
-RECENT NEWS CONTEXT:
+RECENT NEWS ABOUT THIS STOCK:
 {{newsContext}}
 
-Respond in this exact JSON format (no markdown, just JSON):
+Respond ONLY with this exact JSON (no markdown, no explanation outside the JSON):
 {
-  "reasoning": "2-3 sentence professional analysis of why this trade makes sense right now, referencing specific indicators and price action",
-  "riskFlags": ["list", "of", "specific", "risks"],
-  "adjustedStrength": <integer 0-100>,
-  "verdict": "STRONG_BUY | BUY | HOLD | SKIP"
+  "reasoning": "2-3 sentences explaining in simple everyday language WHY this stock is moving right now and why this might be a good short-term opportunity. Imagine explaining it to a friend who knows nothing about stocks. Example: 'Apple just released better-than-expected sales numbers and a lot of people are rushing to buy the stock. When many people buy at once, the price goes up quickly. This could be a short window to ride that wave before it settles down.'",
+  "riskFlags": ["plain everyday-language risk — e.g. 'The company is announcing earnings in 2 days, which could cause the price to swing unpredictably'"],
+  "adjustedStrength": <integer 0-100 — your overall confidence in this trade>
 }
 
-Be concise, specific, and honest. If the setup is marginal, say so. Risk first, profit second.`;
+Rules you must follow:
+- NEVER use these words: RSI, MACD, EMA, ATR, Bollinger, momentum, confluence, resistance, support, breakout, mean reversion, technical
+- DO use phrases like: "rising fast", "falling", "a lot of people are buying right now", "news caused a jump", "the price has been stuck and just broke free", "risky because..."
+- If the trade looks weak, be honest: "This is a lower-confidence trade — it might be better to wait for a stronger opportunity"
+- riskFlags must be in plain language a beginner can understand — no acronyms`;
 
 export async function analyzeSignal(
     symbol: string,
@@ -65,39 +55,26 @@ export async function analyzeSignal(
     const rewardAmt = Math.abs(signal.takeProfit - signal.entryLow);
     const riskPct = ((riskAmt / signal.entryHigh) * 100).toFixed(1);
     const rewardPct = ((rewardAmt / signal.entryLow) * 100).toFixed(1);
+    // Estimated CAD allocation based on signal strength
+    const allocCAD = signal.strength >= 80 ? '10.00' : signal.strength >= 60 ? '7.00' : '5.00';
 
     const newsContext = recentNews.length > 0
         ? recentNews
               .slice(0, 3)
-              .map((n) => `• ${n.headline}${n.summary ? ': ' + n.summary.slice(0, 100) : ''}`)
+              .map((n) => `• ${n.headline}${n.summary ? ': ' + n.summary.slice(0, 120) : ''}`)
               .join('\n')
-        : 'No recent news available — technical setup only.';
+        : 'No recent news found — this signal is based on price and volume patterns only.';
 
     const prompt = ANALYST_PROMPT
         .replace('{{symbol}}', symbol)
-        .replace('{{strategy}}', signal.strategy)
-        .replace('{{direction}}', signal.direction)
-        .replace('{{strength}}', signal.strength.toString())
-        .replace('{{price}}', indicators.currentPrice.toFixed(2))
+        .replace('{{allocCAD}}', allocCAD)
         .replace('{{entryLow}}', signal.entryLow.toFixed(2))
         .replace('{{entryHigh}}', signal.entryHigh.toFixed(2))
         .replace('{{stopLoss}}', signal.stopLoss.toFixed(2))
         .replace('{{takeProfit}}', signal.takeProfit.toFixed(2))
         .replace('{{riskPct}}', riskPct)
         .replace('{{rewardPct}}', rewardPct)
-        .replace('{{rsi}}', isNaN(indicators.rsi) ? 'N/A' : indicators.rsi.toFixed(1))
-        .replace('{{ema9}}', isNaN(indicators.ema9) ? 'N/A' : indicators.ema9.toFixed(2))
-        .replace('{{ema21}}', isNaN(indicators.ema21) ? 'N/A' : indicators.ema21.toFixed(2))
-        .replace('{{ema50}}', isNaN(indicators.ema50) ? 'N/A' : indicators.ema50.toFixed(2))
-        .replace('{{macd}}', isNaN(indicators.macd) ? 'N/A' : indicators.macd.toFixed(4))
-        .replace('{{macdSignal}}', isNaN(indicators.macdSignal) ? 'N/A' : indicators.macdSignal.toFixed(4))
-        .replace('{{histogram}}', isNaN(indicators.macdHistogram) ? 'N/A' : indicators.macdHistogram.toFixed(4))
-        .replace('{{bbPctB}}', isNaN(indicators.bbPercentB) ? 'N/A' : (indicators.bbPercentB * 100).toFixed(0) + '%')
-        .replace('{{bbBandwidth}}', isNaN(indicators.bbBandwidth) ? 'N/A' : (indicators.bbBandwidth * 100).toFixed(1) + '%')
-        .replace('{{atr}}', isNaN(indicators.atr) ? 'N/A' : indicators.atr.toFixed(3))
-        .replace('{{volRatio}}', indicators.volumeRatio.toFixed(1))
-        .replace('{{gap}}', indicators.gapPercent.toFixed(1))
-        .replace('{{catalysts}}', signal.catalysts.join('; '))
+        .replace('{{catalysts}}', signal.catalysts.join('\n• '))
         .replace('{{newsContext}}', newsContext);
 
     try {
@@ -108,7 +85,7 @@ export async function analyzeSignal(
         const parsed = JSON.parse(cleaned);
 
         return {
-            reasoning: parsed.reasoning ?? 'Technical setup meets entry criteria.',
+            reasoning: parsed.reasoning ?? 'This stock is showing signs of short-term movement based on price and trading activity.',
             riskFlags: Array.isArray(parsed.riskFlags) ? parsed.riskFlags : [],
             adjustedStrength: typeof parsed.adjustedStrength === 'number'
                 ? Math.max(0, Math.min(100, parsed.adjustedStrength))
@@ -116,11 +93,15 @@ export async function analyzeSignal(
         };
     } catch (err) {
         console.error(`AI analysis failed for ${symbol}:`, err);
-        // Graceful fallback — return technical-only reasoning
+        // Plain-English fallback — no jargon
+        const catalystText = signal.catalysts.length > 0
+            ? signal.catalysts.join('. ')
+            : 'price and volume patterns';
         return {
-            reasoning: `${symbol} ${signal.strategy} setup: ${signal.catalysts.join('. ')}. Entry $${signal.entryLow.toFixed(2)}-$${signal.entryHigh.toFixed(2)}, stop $${signal.stopLoss.toFixed(2)}, target $${signal.takeProfit.toFixed(2)}.`,
-            riskFlags: ['AI analysis unavailable — review manually'],
+            reasoning: `${symbol} is showing activity based on ${catalystText}. The suggested buy range is $${signal.entryLow.toFixed(2)}–$${signal.entryHigh.toFixed(2)}, with a safety exit at $${signal.stopLoss.toFixed(2)} and a profit target of $${signal.takeProfit.toFixed(2)}.`,
+            riskFlags: ['Could not generate a detailed explanation — review the catalysts above manually'],
             adjustedStrength: signal.strength,
         };
     }
 }
+
